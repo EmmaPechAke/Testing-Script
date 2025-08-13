@@ -18,20 +18,26 @@ jobs:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
 
-      # PMD engine requires Java
+      # PMD needs Java
       - name: Setup Java (JDK 17)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Install Salesforce CLI + Scanner + sgd
+      - name: Install Salesforce CLI + Scanner
         run: |
           npm i -g @salesforce/cli
           sf plugins install @salesforce/sfdx-scanner
-          sf plugins install sfdx-git-delta --force
           sf --version
-          sf plugins
+
+      # Install legacy SFDX and sgd without prompts; call sgd via 'sfdx'
+      - name: Install sfdx + sfdx-git-delta (non-interactive)
+        run: |
+          npm i -g sfdx-cli
+          echo y | sfdx plugins:install sfdx-git-delta
+          sfdx --version
+          sfdx plugins
 
       - name: Populate auth file
         run: echo "${{ secrets.SFDX_QA_URL }}" > ./SFDX_QA_URL.txt
@@ -44,7 +50,7 @@ jobs:
           BASE=${{ github.event.pull_request.base.sha }}
           HEAD=${{ github.sha }}
           mkdir -p changed-sources
-          sf sgd:source:delta --from "$BASE" --to "$HEAD" \
+          sfdx sgd:source:delta --from "$BASE" --to "$HEAD" \
             --output changed-sources/ --generate-delta --source force-app/
 
       - name: Detect empty delta
@@ -76,7 +82,7 @@ jobs:
             --junit \
             --results-dir coverage
 
-      # If no metadata changed, still produce JUnit/Cobertura by running tests explicitly
+      # If no metadata changed, still generate reports
       - name: Fallback: run Apex tests to produce JUnit & Cobertura
         if: steps.delta.outputs.empty == 'true'
         run: |
