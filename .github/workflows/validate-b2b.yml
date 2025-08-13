@@ -13,12 +13,12 @@ permissions:
 jobs:
   validate-branch-to-qa-org:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with:
+          fetch-depth: 0
 
-      # Node 20 for CLI plugins, Java for PMD
+      # Node 20 (SGD requirement) + Java (PMD engine)
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -27,12 +27,23 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Install Salesforce CLI + Scanner + SGD (non-interactive)
+      - name: Install Salesforce CLI + Scanner
         run: |
           npm i -g @salesforce/cli
           sf --version
-          echo y | sf plugins install sfdx-git-delta@6
           sf plugins install @salesforce/sfdx-scanner
+          sf plugins
+
+      # *** Critical: allowlist the unsigned plugin so install is non-interactive ***
+      - name: Allow unsigned plugins (CI)
+        run: |
+          mkdir -p "$HOME/.config/sf" "$HOME/.config/sfdx"
+          printf '["sfdx-git-delta"]\n' > "$HOME/.config/sf/unsignedPluginAllowList.json"
+          printf '["sfdx-git-delta"]\n' > "$HOME/.config/sfdx/unsignedPluginAllowList.json"
+
+      - name: Install sfdx-git-delta (v6) for sf CLI
+        run: |
+          sf plugins install sfdx-git-delta@6
           sf plugins
 
       - name: Populate auth file
@@ -41,7 +52,7 @@ jobs:
       - name: Authenticate to target SF Org
         run: sf org login sfdx-url -f ./SFDX_QA_URL.txt -a qa
 
-      # Ensure the base branch commit is present locally
+      # Ensure the base branch exists locally (GitHub checks out only the PR by default)
       - name: Fetch base branch
         run: |
           git fetch --no-tags origin ${{ github.event.pull_request.base.ref }} --prune --depth=0
@@ -52,7 +63,7 @@ jobs:
           BASE=${{ github.event.pull_request.base.sha }}
           HEAD=${{ github.sha }}
           mkdir -p changed-sources
-          # v6 syntax: sf sgd source delta
+          # v6 syntax
           sf sgd source delta \
             --from "$BASE" \
             --to "$HEAD" \
@@ -69,7 +80,7 @@ jobs:
             echo "empty=false" >> $GITHUB_OUTPUT
           fi
 
-      # Static analysis like your ADO job
+      # Static analysis (mirrors your ADO)
       - name: Run PMD + ESLint-LWC
         run: |
           mkdir -p pmd-report lwc-report
@@ -89,7 +100,7 @@ jobs:
             --junit \
             --results-dir coverage
 
-      # If no metadata changed, still produce JUnit/Cobertura by running tests explicitly
+      # If no metadata changed, still produce JUnit & Cobertura
       - name: Fallback: run Apex tests to produce JUnit & Cobertura
         if: steps.delta.outputs.empty == 'true'
         run: |
@@ -104,8 +115,7 @@ jobs:
 
       - name: Inspect results (debug)
         if: always()
-        run: |
-          echo "== coverage tree ==" && (ls -R coverage || true)
+        run: ls -R coverage || true
 
       - name: Upload PMD report
         uses: actions/upload-artifact@v4
@@ -120,4 +130,22 @@ jobs:
           path: lwc-report/lwc-analysis.csv
 
       - name: Publish JUnit to PR Checks
-        if: always
+        if: always() && hashFiles('coverage/junit/*.xml') != ''
+        uses: dorny/test-reporter@v1
+        with:
+          name: Apex Tests
+          path: coverage/junit/*.xml
+          reporter: java-junit
+
+      - name: Coverage summary (Cobertura → PR summary)
+        if: always() && hashFiles('coverage/coverage/cobertura.xml') != ''
+        uses: irongut/CodeCoverageSummary@v1.3.0
+        with:
+          filename: 'coverage/coverage/cobertura.xml'
+          badge: true
+          format: 'markdown'
+          output: 'both'
+
+      - name: Add coverage to Job Summary
+        if: always() && hashFiles('code-coverage-results.md') != ''
+        run: cat code-coverage-results.md >> $GITHUB_STEP_SUMMARY
