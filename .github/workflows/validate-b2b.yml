@@ -18,26 +18,22 @@ jobs:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
 
-      # PMD needs Java
-      - name: Setup Java (JDK 17)
-        uses: actions/setup-java@v4
+      # Node 20 for CLI plugins, Java for PMD
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Install Salesforce CLI + Scanner
+      - name: Install Salesforce CLI + Scanner + SGD (non-interactive)
         run: |
           npm i -g @salesforce/cli
-          sf plugins install @salesforce/sfdx-scanner
           sf --version
-
-      # Install legacy SFDX and sgd without prompts; call sgd via 'sfdx'
-      - name: Install sfdx + sfdx-git-delta (non-interactive)
-        run: |
-          npm i -g sfdx-cli
-          echo y | sfdx plugins:install sfdx-git-delta
-          sfdx --version
-          sfdx plugins
+          echo y | sf plugins install sfdx-git-delta@6
+          sf plugins install @salesforce/sfdx-scanner
+          sf plugins
 
       - name: Populate auth file
         run: echo "${{ secrets.SFDX_QA_URL }}" > ./SFDX_QA_URL.txt
@@ -45,13 +41,24 @@ jobs:
       - name: Authenticate to target SF Org
         run: sf org login sfdx-url -f ./SFDX_QA_URL.txt -a qa
 
+      # Ensure the base branch commit is present locally
+      - name: Fetch base branch
+        run: |
+          git fetch --no-tags origin ${{ github.event.pull_request.base.ref }} --prune --depth=0
+          git rev-parse ${{ github.event.pull_request.base.sha }}
+
       - name: Create delta packages (PR base ↔ head)
         run: |
           BASE=${{ github.event.pull_request.base.sha }}
           HEAD=${{ github.sha }}
           mkdir -p changed-sources
-          sfdx sgd:source:delta --from "$BASE" --to "$HEAD" \
-            --output changed-sources/ --generate-delta --source force-app/
+          # v6 syntax: sf sgd source delta
+          sf sgd source delta \
+            --from "$BASE" \
+            --to "$HEAD" \
+            --output-dir "changed-sources" \
+            --generate-delta \
+            --source-dir "force-app"
 
       - name: Detect empty delta
         id: delta
@@ -82,7 +89,7 @@ jobs:
             --junit \
             --results-dir coverage
 
-      # If no metadata changed, still generate reports
+      # If no metadata changed, still produce JUnit/Cobertura by running tests explicitly
       - name: Fallback: run Apex tests to produce JUnit & Cobertura
         if: steps.delta.outputs.empty == 'true'
         run: |
@@ -113,22 +120,4 @@ jobs:
           path: lwc-report/lwc-analysis.csv
 
       - name: Publish JUnit to PR Checks
-        if: always() && hashFiles('coverage/junit/*.xml') != ''
-        uses: dorny/test-reporter@v1
-        with:
-          name: Apex Tests
-          path: coverage/junit/*.xml
-          reporter: java-junit
-
-      - name: Coverage summary (Cobertura → PR summary)
-        if: always() && hashFiles('coverage/coverage/cobertura.xml') != ''
-        uses: irongut/CodeCoverageSummary@v1.3.0
-        with:
-          filename: 'coverage/coverage/cobertura.xml'
-          badge: true
-          format: 'markdown'
-          output: 'both'
-
-      - name: Add coverage to Job Summary
-        if: always() && hashFiles('code-coverage-results.md') != ''
-        run: cat code-coverage-results.md >> $GITHUB_STEP_SUMMARY
+        if: always
