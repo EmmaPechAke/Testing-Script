@@ -1,87 +1,80 @@
-# Unique name for this workflow
 name: Validate Pull Request
 
-# Definition when the workflow should run
 on:
   pull_request:
     types: [opened, reopened, edited, synchronize]
-    # only applies to PRs that want to merge to qa
     branches: [dev]
-            
-# Jobs to be executed
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+
 jobs:
   validate-branch-to-qa-org:
     runs-on: ubuntu-latest
     if: ${{ github.actor != 'dependabot[bot]' }}
 
-    permissions:
-      contents: read
-      checks: write
-      pull-requests: write
-
     steps:
-      # --- Tooling & CLIs ---
-      - name: Checkout source code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
+          # get full history so merge-base works and SHAs can be fetched
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Setup Node.js 20 (for CLIs)
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Setup Java (PMD engine needs it)
-        uses: actions/setup-java@v4
+      # Tooling
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Install Salesforce CLIs
+      - name: Install Salesforce CLIs and plugins (non-interactive)
         run: |
           npm i -g @salesforce/cli sfdx-cli
-          sf --version
-          sfdx --version
-
-      # Avoid unsigned-plugin prompts for both sf & sfdx
-      - name: Allow unsigned plugins (CI)
-        run: |
+          # allow unsigned plugin prompts for CI
           mkdir -p "$HOME/.config/sf" "$HOME/.config/sfdx"
           printf '["sfdx-git-delta"]\n' > "$HOME/.config/sf/unsignedPluginAllowList.json"
           printf '["sfdx-git-delta"]\n' > "$HOME/.config/sfdx/unsignedPluginAllowList.json"
-
-      # Install the delta plugin for the legacy sfdx CLI and print plugins
-      - name: Install sfdx-git-delta
-        run: |
+          # install plugins
           yes | sfdx plugins:install sfdx-git-delta
-          sfdx plugins
-
-      - name: Install Salesforce Code Analyzer
-        run: |
           sf plugins install @salesforce/sfdx-scanner
-          sf plugins
+          sfdx --version && sfdx plugins
+          sf --version && sf plugins
 
-      # --- Auth to target org ---
-      - name: Populate auth file with SFDX_URL secret of the target SF org
-        shell: bash
-        run: |
-          echo "${{ secrets.SFDX_QA_URL }}" > ./SFDX_QA_URL.txt
-
+      # Auth
+      - name: Populate auth file
+        run: echo "${{ secrets.SFDX_QA_URL }}" > ./SFDX_QA_URL.txt
       - name: Authenticate to target SF Org
         run: sf org login sfdx-url -f ./SFDX_QA_URL.txt -a qa
 
-      # --- Delta creation (PR base ↔ head) ---
-      - name: Ensure base branch commit exists locally
+      # --- FIX: ensure/resolve BASE SHA locally ---
+      - name: Resolve base SHA (fetch or merge-base fallback)
+        id: base
+        shell: bash
         run: |
-          git fetch --no-tags origin ${{ github.event.pull_request.base.ref }} --prune --depth=0
-          git rev-parse ${{ github.event.pull_request.base.sha }}
+          set -euo pipefail
+          BASE_REF="${{ github.event.pull_request.base.ref }}"
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          # fetch the base branch and the exact base commit
+          git fetch --no-tags --prune origin +refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}
+          git fetch --no-tags --prune --depth=1 origin ${BASE_SHA}:${BASE_SHA} || true
+          if git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            USE_SHA="${BASE_SHA}"
+          else
+            echo "Base SHA not found locally; computing via merge-base with origin/${BASE_REF}"
+            USE_SHA="$(git merge-base "origin/${BASE_REF}" "${GITHUB_SHA}")"
+          fi
+          echo "sha=${USE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Using base commit: ${USE_SHA}"
 
-      - name: Create delta packages for new, modified or deleted metadata
+      # Delta
+      - name: Create delta packages (PR base ↔ head)
         run: |
-          BASE=${{ github.event.pull_request.base.sha }}
+          BASE=${{ steps.base.outputs.sha }}
           HEAD=${{ github.sha }}
           mkdir -p changed-sources
-          # Use the plugin via *sfdx* CLI
           sfdx sgd:source:delta \
             --from "$BASE" \
             --to "$HEAD" \
@@ -98,7 +91,7 @@ jobs:
             echo "empty=false" >> $GITHUB_OUTPUT
           fi
 
-      # --- Static analysis (optional but useful artifacts) ---
+      # Static analysis (optional but useful)
       - name: Run PMD + ESLint-LWC
         run: |
           mkdir -p pmd-report lwc-report
@@ -107,8 +100,8 @@ jobs:
           sf scanner run --target "force-app/main/default/lwc/**/*" --engine eslint-lwc \
             --outfile "lwc-report/lwc-analysis.csv" --format csv
 
-      # --- Deploy validate (runs tests) -> produce JUnit + Cobertura ---
-      - name: Validate the delta to target SF org (with tests & reports)
+      # Validate (runs tests) -> produce JUnit + Cobertura under coverage/
+      - name: Validate delta with tests + reports
         if: steps.delta.outputs.empty == 'false'
         run: |
           sf project deploy validate \
@@ -119,7 +112,7 @@ jobs:
             --junit \
             --results-dir coverage
 
-      # Fallback: if no metadata changed, still run tests so we get reports
+      # Fallback when no metadata changed: still run tests to get reports
       - name: Run Apex tests to produce JUnit & Cobertura (fallback)
         if: steps.delta.outputs.empty == 'true'
         run: |
@@ -132,12 +125,7 @@ jobs:
             --wait 60 \
             --target-org qa || true
 
-      # --- Debug output (doesn't fail if empty) ---
-      - name: Inspect results tree
-        if: always()
-        run: ls -R coverage || true
-
-      # --- “Graphics” in PR: Test check + Coverage badge in Summary ---
+      # Visuals in PR / Job Summary
       - name: Publish JUnit to PR Checks
         if: always() && hashFiles('coverage/junit/*.xml') != ''
         uses: dorny/test-reporter@v1
@@ -159,7 +147,7 @@ jobs:
         if: always() && hashFiles('code-coverage-results.md') != ''
         run: cat code-coverage-results.md >> $GITHUB_STEP_SUMMARY
 
-      # --- Optional: upload analyzer CSVs as artifacts ---
+      # Artifacts (optional)
       - name: Upload PMD report
         if: always() && hashFiles('pmd-report/pmd-analysis.csv') != ''
         uses: actions/upload-artifact@v4
