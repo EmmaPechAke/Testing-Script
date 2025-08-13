@@ -13,12 +13,12 @@ permissions:
 jobs:
   validate-branch-to-qa-org:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
 
-      # Node 20 (SGD requirement) + Java (PMD engine)
+      # Tooling (Node for CLIs; Java for PMD engine)
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -27,6 +27,7 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # Install modern Salesforce CLI + scanner (used for scan/validate/test)
       - name: Install Salesforce CLI + Scanner
         run: |
           npm i -g @salesforce/cli
@@ -34,17 +35,20 @@ jobs:
           sf plugins install @salesforce/sfdx-scanner
           sf plugins
 
-      # *** Critical: allowlist the unsigned plugin so install is non-interactive ***
-      - name: Allow unsigned plugins (CI)
+      # *** Allowlist unsigned plugins for BOTH sf & sfdx to avoid prompts ***
+      - name: Allow unsigned plugins (no prompts in CI)
         run: |
           mkdir -p "$HOME/.config/sf" "$HOME/.config/sfdx"
           printf '["sfdx-git-delta"]\n' > "$HOME/.config/sf/unsignedPluginAllowList.json"
           printf '["sfdx-git-delta"]\n' > "$HOME/.config/sfdx/unsignedPluginAllowList.json"
 
-      - name: Install sfdx-git-delta (v6) for sf CLI
+      # Install legacy SFDX CLI and install sgd there; use `sfdx` to run delta
+      - name: Install sfdx + sfdx-git-delta
         run: |
-          sf plugins install sfdx-git-delta@6
-          sf plugins
+          npm i -g sfdx-cli
+          sfdx --version
+          sfdx plugins:install sfdx-git-delta
+          sfdx plugins
 
       - name: Populate auth file
         run: echo "${{ secrets.SFDX_QA_URL }}" > ./SFDX_QA_URL.txt
@@ -52,7 +56,7 @@ jobs:
       - name: Authenticate to target SF Org
         run: sf org login sfdx-url -f ./SFDX_QA_URL.txt -a qa
 
-      # Ensure the base branch exists locally (GitHub checks out only the PR by default)
+      # Ensure the base branch commit exists locally (needed for diff)
       - name: Fetch base branch
         run: |
           git fetch --no-tags origin ${{ github.event.pull_request.base.ref }} --prune --depth=0
@@ -63,13 +67,13 @@ jobs:
           BASE=${{ github.event.pull_request.base.sha }}
           HEAD=${{ github.sha }}
           mkdir -p changed-sources
-          # v6 syntax
-          sf sgd source delta \
+          # Use the plugin via *sfdx* CLI
+          sfdx sgd:source:delta \
             --from "$BASE" \
             --to "$HEAD" \
-            --output-dir "changed-sources" \
+            --output changed-sources/ \
             --generate-delta \
-            --source-dir "force-app"
+            --source force-app/
 
       - name: Detect empty delta
         id: delta
@@ -80,7 +84,7 @@ jobs:
             echo "empty=false" >> $GITHUB_OUTPUT
           fi
 
-      # Static analysis (mirrors your ADO)
+      # Static analysis (matches your ADO job)
       - name: Run PMD + ESLint-LWC
         run: |
           mkdir -p pmd-report lwc-report
@@ -100,7 +104,7 @@ jobs:
             --junit \
             --results-dir coverage
 
-      # If no metadata changed, still produce JUnit & Cobertura
+      # If no metadata changed, still produce reports by running tests explicitly
       - name: Fallback: run Apex tests to produce JUnit & Cobertura
         if: steps.delta.outputs.empty == 'true'
         run: |
