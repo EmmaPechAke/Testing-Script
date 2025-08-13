@@ -10,41 +10,166 @@ on:
             
 # Jobs to be executed
 jobs:
-    validate-branch-to-qa-org:
-        runs-on: ubuntu-latest
-        if: ${{ github.actor != 'dependabot[bot]' }}
-        steps:
-            - name: 'Install Salesforce CLI'
-              run: |
-                  wget https://developer.salesforce.com/media/salesforce-cli/sfdx/channels/stable/sfdx-linux-x64.tar.xz
-                  mkdir ~/sfdx
-                  tar xJf sfdx-linux-x64.tar.xz -C ~/sfdx --strip-components 1
-                  echo "$HOME/sfdx/bin" >> $GITHUB_PATH
-                  ~/sfdx/bin/sfdx version
+  validate-branch-to-qa-org:
+    runs-on: ubuntu-latest
+    if: ${{ github.actor != 'dependabot[bot]' }}
 
-            # https://github.com/scolladon/sfdx-git-delta
-            - name: 'Installing sfdx git delta'
-              run: | 
-                  echo y | sfdx plugins:install sfdx-git-delta
-                  sfdx plugins 
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
 
-            - name: 'Checkout source code'
-              uses: actions/checkout@v3
-              with:
-                fetch-depth: 0
+    steps:
+      # --- Tooling & CLIs ---
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-            - name: 'Populate auth file with SFDX_URL secret of the target SF org'
-              shell: bash
-              run: |
-                  echo ${{ secrets.SFDX_QA_URL}} > ./SFDX_QA_URL.txt
+      - name: Setup Node.js 20 (for CLIs)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
-            - name: 'Create delta packages for new, modified or deleted metadata'
-              run: | 
-                  mkdir changed-sources
-                  sfdx sgd:source:delta --to "HEAD" --from "HEAD^" --output changed-sources/ --generate-delta --source force-app/
+      - name: Setup Java (PMD engine needs it)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
 
-            - name: 'Authenticate to target SF Org'
-              run: sfdx auth:sfdxurl:store -f ./SFDX_QA_URL.txt -s -a qa
+      - name: Install Salesforce CLIs
+        run: |
+          npm i -g @salesforce/cli sfdx-cli
+          sf --version
+          sfdx --version
 
-            - name: 'Validate the delta to target SF org'
-              run: sf project deploy start -x "changed-sources/package/package.xml" -l NoTestRun --dry-run
+      # Avoid unsigned-plugin prompts for both sf & sfdx
+      - name: Allow unsigned plugins (CI)
+        run: |
+          mkdir -p "$HOME/.config/sf" "$HOME/.config/sfdx"
+          printf '["sfdx-git-delta"]\n' > "$HOME/.config/sf/unsignedPluginAllowList.json"
+          printf '["sfdx-git-delta"]\n' > "$HOME/.config/sfdx/unsignedPluginAllowList.json"
+
+      # Install the delta plugin for the legacy sfdx CLI and print plugins
+      - name: Install sfdx-git-delta
+        run: |
+          yes | sfdx plugins:install sfdx-git-delta
+          sfdx plugins
+
+      - name: Install Salesforce Code Analyzer
+        run: |
+          sf plugins install @salesforce/sfdx-scanner
+          sf plugins
+
+      # --- Auth to target org ---
+      - name: Populate auth file with SFDX_URL secret of the target SF org
+        shell: bash
+        run: |
+          echo "${{ secrets.SFDX_QA_URL }}" > ./SFDX_QA_URL.txt
+
+      - name: Authenticate to target SF Org
+        run: sf org login sfdx-url -f ./SFDX_QA_URL.txt -a qa
+
+      # --- Delta creation (PR base ↔ head) ---
+      - name: Ensure base branch commit exists locally
+        run: |
+          git fetch --no-tags origin ${{ github.event.pull_request.base.ref }} --prune --depth=0
+          git rev-parse ${{ github.event.pull_request.base.sha }}
+
+      - name: Create delta packages for new, modified or deleted metadata
+        run: |
+          BASE=${{ github.event.pull_request.base.sha }}
+          HEAD=${{ github.sha }}
+          mkdir -p changed-sources
+          # Use the plugin via *sfdx* CLI
+          sfdx sgd:source:delta \
+            --from "$BASE" \
+            --to "$HEAD" \
+            --output changed-sources/ \
+            --generate-delta \
+            --source force-app/
+
+      - name: Detect empty delta
+        id: delta
+        run: |
+          if [ ! -s changed-sources/package/package.xml ] || ! grep -q "<types>" changed-sources/package/package.xml; then
+            echo "empty=true" >> $GITHUB_OUTPUT
+          else
+            echo "empty=false" >> $GITHUB_OUTPUT
+          fi
+
+      # --- Static analysis (optional but useful artifacts) ---
+      - name: Run PMD + ESLint-LWC
+        run: |
+          mkdir -p pmd-report lwc-report
+          sf scanner run --target "force-app" --engine pmd \
+            --outfile "pmd-report/pmd-analysis.csv" --format csv
+          sf scanner run --target "force-app/main/default/lwc/**/*" --engine eslint-lwc \
+            --outfile "lwc-report/lwc-analysis.csv" --format csv
+
+      # --- Deploy validate (runs tests) -> produce JUnit + Cobertura ---
+      - name: Validate the delta to target SF org (with tests & reports)
+        if: steps.delta.outputs.empty == 'false'
+        run: |
+          sf project deploy validate \
+            --manifest "changed-sources/package/package.xml" \
+            --target-org qa \
+            --test-level RunLocalTests \
+            --coverage-formatters cobertura \
+            --junit \
+            --results-dir coverage
+
+      # Fallback: if no metadata changed, still run tests so we get reports
+      - name: Run Apex tests to produce JUnit & Cobertura (fallback)
+        if: steps.delta.outputs.empty == 'true'
+        run: |
+          mkdir -p coverage
+          sf apex run test \
+            --test-level RunLocalTests \
+            --code-coverage \
+            --result-format junit \
+            --output-dir coverage \
+            --wait 60 \
+            --target-org qa || true
+
+      # --- Debug output (doesn't fail if empty) ---
+      - name: Inspect results tree
+        if: always()
+        run: ls -R coverage || true
+
+      # --- “Graphics” in PR: Test check + Coverage badge in Summary ---
+      - name: Publish JUnit to PR Checks
+        if: always() && hashFiles('coverage/junit/*.xml') != ''
+        uses: dorny/test-reporter@v1
+        with:
+          name: Apex Tests
+          path: coverage/junit/*.xml
+          reporter: java-junit
+
+      - name: Coverage summary (Cobertura → PR Summary)
+        if: always() && hashFiles('coverage/coverage/cobertura.xml') != ''
+        uses: irongut/CodeCoverageSummary@v1.3.0
+        with:
+          filename: 'coverage/coverage/cobertura.xml'
+          badge: true
+          format: 'markdown'
+          output: 'both'
+
+      - name: Add coverage to Job Summary
+        if: always() && hashFiles('code-coverage-results.md') != ''
+        run: cat code-coverage-results.md >> $GITHUB_STEP_SUMMARY
+
+      # --- Optional: upload analyzer CSVs as artifacts ---
+      - name: Upload PMD report
+        if: always() && hashFiles('pmd-report/pmd-analysis.csv') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: PMDAnalysisReport
+          path: pmd-report/pmd-analysis.csv
+
+      - name: Upload LWC report
+        if: always() && hashFiles('lwc-report/lwc-analysis.csv') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: LWCAnalysisReport
+          path: lwc-report/lwc-analysis.csv
