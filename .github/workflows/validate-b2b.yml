@@ -1,0 +1,79 @@
+on:
+  pull_request:
+    types: [opened, reopened, edited, synchronize]
+    # only applies to PRs that want to merge to qa
+    branches: [dev]
+jobs:
+  validate-branch-to-qa-org:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Install Salesforce CLI + Scanner
+        run: |
+          npm i -g @salesforce/cli
+          sf plugins install @salesforce/sfdx-scanner
+          sf --version
+
+      - name: Populate auth file
+        run: echo "${{ secrets.SFDX_QA_URL }}" > ./SFDX_QA_URL.txt
+
+      - name: Authenticate to target SF Org
+        run: sf org login sfdx-url -f ./SFDX_QA_URL.txt -a qa
+
+      - name: Create delta packages (PR base ↔ head)
+        run: |
+          BASE=${{ github.event.pull_request.base.sha }}
+          HEAD=${{ github.sha }}
+          mkdir -p changed-sources
+          # sfdx-git-delta command (works via sfdx shim in the new CLI)
+          sfdx plugins:install sfdx-git-delta
+          sfdx sgd:source:delta --from "$BASE" --to "$HEAD" \
+            --output changed-sources/ --generate-delta --source force-app/
+
+      # Static analysis like your ADO job
+      - name: Run PMD + ESLint-LWC
+        run: |
+          mkdir -p pmd-report lwc-report
+          sf scanner run --target "force-app" --engine pmd \
+            --outfile "pmd-report/pmd-analysis.csv" --format csv
+          sf scanner run --target "force-app/main/default/lwc/**/*" --engine eslint-lwc \
+            --outfile "lwc-report/lwc-analysis.csv" --format csv
+
+      - name: Validate delta with tests + reports
+        run: |
+          sf project deploy validate \
+            --manifest "changed-sources/package/package.xml" \
+            --target-org qa \
+            --test-level RunLocalTests \
+            --coverage-formatters cobertura \
+            --junit
+
+      - name: Upload PMD report
+        uses: actions/upload-artifact@v4
+        with: { name: PMDAnalysisReport, path: pmd-report/pmd-analysis.csv }
+
+      - name: Upload LWC report
+        uses: actions/upload-artifact@v4
+        with: { name: LWCAnalysisReport, path: lwc-report/lwc-analysis.csv }
+
+      - name: Publish JUnit to PR Checks
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: Apex Tests
+          path: coverage/junit/junit.xml
+          reporter: java-junit
+
+      - name: Coverage summary (Cobertura → PR summary)
+        if: always()
+        uses: irongut/CodeCoverageSummary@v1.3.0
+        with:
+          filename: 'coverage/coverage/cobertura.xml'
+          badge: true
+          format: 'markdown'
+          output: 'both'
+      - name: Add coverage to Job Summary
+        if: always()
+        run: cat code-coverage-results.md >> $GITHUB_STEP_SUMMARY
